@@ -1,0 +1,8 @@
+{
+  "name": "Secure Chat",
+  "description": "A secure, peer-to-pure workspace for private communication, featuring encrypted chat, file sharing, and real-time video/screen sharing between two designated users.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ]
+}
