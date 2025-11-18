@@ -4,7 +4,8 @@ export const CREDENTIALS = [
 ];
 
 // Unique prefix to avoid collisions on public PeerJS server
-const ID_PREFIX = 'secure-nexus-p2p-v1-';
+// Using v2 prefix to ensure fresh connections for deployment
+const ID_PREFIX = 'secure-chat-v2-';
 
 export const PEER_IDS = {
   'aryaveer': `${ID_PREFIX}aryaveer`,

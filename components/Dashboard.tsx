@@ -30,10 +30,19 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
       peerRef.current.destroy();
     }
 
-    // Initialize PeerJS with debug: 0 to suppress "Error" logs in console when peer is missing
-    // This addresses the user's concern about the visible error message
+    // Initialize PeerJS with STUN servers for NAT traversal
+    // This is critical for deployed apps to work across different networks
     const newPeer = new (window as any).Peer(myPeerId, {
-      debug: 0 
+      debug: 2,
+      config: {
+        iceServers: [
+          { urls: 'stun:stun.l.google.com:19302' },
+          { urls: 'stun:stun1.l.google.com:19302' },
+          { urls: 'stun:stun2.l.google.com:19302' },
+          { urls: 'stun:stun3.l.google.com:19302' },
+          { urls: 'stun:stun4.l.google.com:19302' },
+        ],
+      },
     });
     
     peerRef.current = newPeer;
