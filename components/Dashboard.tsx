@@ -15,6 +15,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
   const [messages, setMessages] = useState<Message[]>([]);
   const [isConnected, setIsConnected] = useState(false);
   const [incomingCall, setIncomingCall] = useState<any>(null);
+  const [isSecure, setIsSecure] = useState(true);
   
   // Use refs for connection management to avoid closure staleness in callbacks
   const retryTimeoutRef = useRef<any>(null);
@@ -25,81 +26,47 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
   const targetPeerId = TARGET_IDS[user.id as keyof typeof TARGET_IDS];
 
   useEffect(() => {
-    // Cleanup any existing peer instance on mount/user change
-    if (peerRef.current) {
-      peerRef.current.destroy();
+    // Check for HTTPS (required for WebRTC video/audio outside localhost)
+    if (window.location.protocol !== 'https:' && window.location.hostname !== 'localhost') {
+      setIsSecure(false);
     }
 
-    // Initialize PeerJS with STUN servers for NAT traversal
-    // This is critical for deployed apps to work across different networks
+    initializePeer();
+
+    return () => {
+      cleanupPeer();
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user.id]);
+
+  const cleanupPeer = () => {
+    if (retryTimeoutRef.current) clearTimeout(retryTimeoutRef.current);
+    if (connectionRef.current) connectionRef.current.close();
+    if (peerRef.current) peerRef.current.destroy();
+    connectionRef.current = null;
+    peerRef.current = null;
+    setIsConnected(false);
+  };
+
+  const initializePeer = () => {
+    // Cleanup existing
+    if (peerRef.current) cleanupPeer();
+
+    console.log("Initializing PeerJS...");
+    
     const newPeer = new (window as any).Peer(myPeerId, {
-      debug: 2,
+      debug: 1,
       config: {
         iceServers: [
           { urls: 'stun:stun.l.google.com:19302' },
           { urls: 'stun:stun1.l.google.com:19302' },
           { urls: 'stun:stun2.l.google.com:19302' },
           { urls: 'stun:stun3.l.google.com:19302' },
-          { urls: 'stun:stun4.l.google.com:19302' },
         ],
       },
     });
     
     peerRef.current = newPeer;
-
-    const connectToPeer = () => {
-      if (newPeer.destroyed) return;
-      
-      // If we already have an active, open connection, don't interrupt it
-      if (connectionRef.current && connectionRef.current.open) return;
-
-      console.log(`Attempting connection to ${targetPeerId}...`);
-      
-      // Close any stale/pending connection attempt before starting a new one
-      if (connectionRef.current) {
-          connectionRef.current.close();
-      }
-
-      const connection = newPeer.connect(targetPeerId, {
-        reliable: true
-      });
-      
-      setupConnection(connection);
-    };
-
-    const setupConnection = (connection: any) => {
-      connectionRef.current = connection;
-
-      connection.on('open', () => {
-        console.log('Connection established with ' + connection.peer);
-        setIsConnected(true);
-        // Clear any pending retry timeouts since we are now connected
-        if (retryTimeoutRef.current) {
-          clearTimeout(retryTimeoutRef.current);
-          retryTimeoutRef.current = null;
-        }
-      });
-
-      connection.on('data', (data: any) => {
-        setMessages(prev => [...prev, data]);
-      });
-
-      connection.on('close', () => {
-        console.log('Connection closed');
-        setIsConnected(false);
-        connectionRef.current = null;
-        
-        // Auto-reconnect if the connection drops and peer is still alive
-        if (peerRef.current && !peerRef.current.destroyed) {
-            retryTimeoutRef.current = setTimeout(connectToPeer, 3000);
-        }
-      });
-      
-      connection.on('error', (err: any) => {
-          console.error('Connection error:', err);
-          setIsConnected(false);
-      });
-    };
 
     newPeer.on('open', (id: string) => {
       console.log('My peer ID is: ' + id);
@@ -110,7 +77,6 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
 
     newPeer.on('connection', (connection: any) => {
       console.log('Incoming connection from', connection.peer);
-      // If we receive a connection, accept it and use it
       setupConnection(connection);
     });
 
@@ -121,37 +87,108 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
     });
 
     newPeer.on('error', (err: any) => {
-      // Handle "peer-unavailable" specifically
-      if (err.type === 'peer-unavailable') {
-        // If we are already connected (e.g. via incoming connection), ignore this error
-        if (connectionRef.current && connectionRef.current.open) return;
+      console.warn('Peer error:', err.type, err);
 
-        // Otherwise, it means target is offline. Retry silently.
-        console.log('Target peer unavailable. Retrying in 3 seconds...');
+      if (err.type === 'peer-unavailable') {
+        // The peer we are trying to call is not online yet.
+        // If we have a pending connection ref that failed, clear it so we can retry.
+        if (connectionRef.current && !connectionRef.current.open) {
+            connectionRef.current = null;
+        }
+
         setIsConnected(false);
         
+        // Retry logic
         if (retryTimeoutRef.current) clearTimeout(retryTimeoutRef.current);
         retryTimeoutRef.current = setTimeout(() => {
           connectToPeer();
         }, 3000);
-      } else if (err.type === 'network' || err.type === 'disconnected') {
-          console.log('Network error or disconnected. Reconnecting...');
+      } else if (err.type === 'network' || err.type === 'disconnected' || err.type === 'server-error' || err.type === 'socket-error') {
           setIsConnected(false);
-          newPeer.reconnect();
-      } else {
-          // Log other errors
-          console.error('Peer error:', err.type, err);
+          // fatal errors might require a full reconnect
+          if (!newPeer.destroyed) {
+             newPeer.reconnect();
+          }
+      }
+    });
+  };
+
+  const connectToPeer = () => {
+    if (!peerRef.current || peerRef.current.destroyed) return;
+    
+    // Crucial Fix: If we already have a connection handle (either connecting or open), 
+    // do NOT overwrite it or close it. This prevents race conditions where two peers 
+    // calling each other simultaneously cancel each other's connections.
+    if (connectionRef.current) {
+        if (connectionRef.current.open) {
+            return; // Already connected
+        }
+        // If it's not open, it might be in 'connecting' state. 
+        // We let the existing attempt play out. If it fails, 'close'/'error' will clear connectionRef.
+        console.log("Connection attempt skipped: active connection handle exists.");
+        return;
+    }
+
+    console.log(`Attempting connection to ${targetPeerId}...`);
+    
+    const connection = peerRef.current.connect(targetPeerId, {
+      reliable: true,
+      serialization: 'json'
+    });
+    
+    setupConnection(connection);
+  };
+
+  const setupConnection = (connection: any) => {
+    // If we already have a working connection, ignore new ones to avoid confusion
+    if (connectionRef.current && connectionRef.current.open) {
+        return;
+    }
+
+    connectionRef.current = connection;
+
+    connection.on('open', () => {
+      console.log('Connection established with ' + connection.peer);
+      setIsConnected(true);
+      
+      // Stop retrying
+      if (retryTimeoutRef.current) {
+        clearTimeout(retryTimeoutRef.current);
+        retryTimeoutRef.current = null;
       }
     });
 
-    return () => {
-      if (retryTimeoutRef.current) clearTimeout(retryTimeoutRef.current);
-      if (connectionRef.current) connectionRef.current.close();
-      if (peerRef.current) peerRef.current.destroy();
-      peerRef.current = null;
-    };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [user.id]);
+    connection.on('data', (data: any) => {
+      setMessages(prev => [...prev, data]);
+    });
+
+    connection.on('close', () => {
+      console.log('Connection closed');
+      // Only clear if this was the active connection
+      if (connectionRef.current === connection) {
+          setIsConnected(false);
+          connectionRef.current = null;
+          
+          // Auto-reconnect
+          if (peerRef.current && !peerRef.current.destroyed) {
+              retryTimeoutRef.current = setTimeout(connectToPeer, 2000);
+          }
+      }
+    });
+    
+    connection.on('error', (err: any) => {
+        console.error('Connection error:', err);
+        if (connectionRef.current === connection) {
+            setIsConnected(false);
+            connectionRef.current = null;
+        }
+    });
+  };
+
+  const manualReconnect = () => {
+      setIsConnected(false);
+      initializePeer();
+  };
 
   const sendMessage = (text: string, attachments: any[] = []) => {
     if (!connectionRef.current || !isConnected) return;
@@ -171,11 +208,19 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
     } catch (e) {
         console.error("Error sending message", e);
         setIsConnected(false);
+        // Try to reconnect if send fails
+        connectToPeer();
     }
   };
 
   return (
     <div className="flex h-screen bg-slate-950 text-slate-200 overflow-hidden font-sans">
+      {!isSecure && (
+        <div className="absolute top-0 left-0 w-full bg-red-600 text-white text-xs p-1 text-center z-50 font-bold">
+          WARNING: Application is not running over HTTPS. Video/Microphone features will likely fail.
+        </div>
+      )}
+
       {/* Sidebar */}
       <div className="w-20 lg:w-64 flex-shrink-0 bg-slate-900 border-r border-slate-800 flex flex-col justify-between transition-all duration-300">
         <div>
@@ -213,17 +258,26 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
         </div>
 
         <div className="p-4 border-t border-slate-800">
-          <div className="mb-4">
+          <div className="mb-4 bg-slate-800/50 p-3 rounded-lg">
              <div className="flex items-center justify-between text-xs text-slate-400 mb-2">
-                <span className="hidden lg:block">Status</span>
-                <span className={`w-2 h-2 rounded-full ${isConnected ? 'bg-green-500 shadow-[0_0_10px_rgba(34,197,94,0.5)]' : 'bg-yellow-500 animate-pulse'}`}></span>
+                <span className="font-semibold">Connection Status</span>
+                <span className={`w-2 h-2 rounded-full ${isConnected ? 'bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.6)]' : 'bg-yellow-500 animate-pulse'}`}></span>
              </div>
              {isConnected ? (
-                 <p className="text-xs text-green-400 hidden lg:block">Encrypted Tunnel Active</p>
+                 <p className="text-xs text-green-400 font-medium">Secure Tunnel Active</p>
              ) : (
-                 <p className="text-xs text-yellow-500 hidden lg:block">Establishing Connection...</p>
+                 <div className="space-y-2">
+                    <p className="text-xs text-yellow-500 animate-pulse">Connecting to peer...</p>
+                    <button 
+                        onClick={manualReconnect}
+                        className="w-full py-1 px-2 bg-slate-700 hover:bg-slate-600 text-[10px] uppercase font-bold tracking-wider text-slate-300 rounded transition-colors"
+                    >
+                        Reset Connection
+                    </button>
+                 </div>
              )}
           </div>
+
           <div className="flex items-center lg:space-x-3 mb-4 justify-center lg:justify-start">
             <img src={PLACEHOLDER_AVATAR} alt="User" className="w-10 h-10 rounded-full border-2 border-slate-700" />
             <div className="hidden lg:block overflow-hidden">
